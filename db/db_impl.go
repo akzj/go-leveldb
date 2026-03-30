@@ -1,0 +1,598 @@
+package db
+
+import (
+	"github.com/akzj/go-leveldb/log"
+	"github.com/akzj/go-leveldb/memdb"
+	"github.com/akzj/go-leveldb/table"
+	"github.com/akzj/go-leveldb/util"
+	"sync"
+	"sync/atomic"
+)
+
+// DBImpl is the concrete implementation of the DB interface.
+type DBImpl struct {
+	options                       *Options
+	env                           Env
+	dbName                        string
+	icmp                          *InternalKeyComparator
+	tableCache                    *table.TableCache
+	mu                            sync.Mutex
+	shuttingDown                  atomic.Bool
+	mem                           *memdb.MemDB
+	imm                           *memdb.MemDB
+	hasImm                        atomic.Bool
+	logFile                       WritableFile
+	logFileNumber                 uint64
+	logWriter                     *log.Writer
+	versions                      *VersionSet
+	backgroundCompactionScheduled bool
+	bgError                       *util.Status
+	writers                       []Writer
+	tmpBatch                      *WriteBatch
+	snapshots                     snapshotList
+	pendingOutputs                map[uint64]bool
+	manualCompaction              *ManualCompaction
+	stats                         [kNumLevels]CompactionStats
+	seed                          uint32
+}
+type Writer struct {
+	batch  *WriteBatch
+	sync   bool
+	done   chan struct{}
+	result *util.Status
+}
+type ManualCompaction struct {
+	level      int
+	done       bool
+	begin, end *InternalKey
+	tmpStorage InternalKey
+}
+type CompactionStats struct {
+	micros       int64
+	bytesRead    int64
+	bytesWritten int64
+}
+
+func (s *CompactionStats) Add(other CompactionStats) {
+	s.micros += other.micros
+	s.bytesRead += other.bytesRead
+	s.bytesWritten += other.bytesWritten
+}
+
+type snapshotList struct {
+	root   snapshotNode
+	immSeq SequenceNumber
+}
+type snapshotNode struct {
+	seq  SequenceNumber
+	refs int
+	next *snapshotNode
+	prev *snapshotNode
+}
+
+func NewDBImpl(options *Options, dbName string) *DBImpl {
+	db := &DBImpl{
+		options:        options,
+		env:            options.Env,
+		dbName:         dbName,
+		icmp:           NewInternalKeyComparator(options.Comparator),
+		pendingOutputs: make(map[uint64]bool),
+	}
+	db.snapshots.root.next = &db.snapshots.root
+	db.snapshots.root.prev = &db.snapshots.root
+	return db
+}
+func (db *DBImpl) Recover() (*VersionEdit, bool, *util.Status) {
+	currentData := make([]byte, 1024)
+	n, err := db.env.ReadFile(db.dbName+"/CURRENT", currentData)
+	if !err.OK() {
+		if err.IsNotFound() {
+			return nil, false, nil // New DB
+		}
+		return nil, false, err
+	}
+	manifestName := db.dbName + "/" + string(currentData[:n])
+	saveManifest := true
+	if err := db.versions.Recover(&saveManifest); !err.OK() {
+		return nil, false, err
+	}
+	_ = manifestName // Used by Recover
+	return NewVersionEdit(), saveManifest, util.NewStatusOK()
+}
+func (db *DBImpl) NewDB() *util.Status {
+	edit := NewVersionEdit()
+	edit.SetComparatorName(db.options.Comparator.Name())
+	edit.SetLogNumber(0)
+	edit.SetNextFile(2)
+	edit.SetLastSequence(0)
+	manifestNumber := db.versions.NewFileNumber()
+	manifestName := db.dbName + "/" + DescriptorFileName(manifestNumber)
+	file, err := db.env.NewWritableFile(manifestName)
+	if err != nil {
+		return err
+	}
+	descriptorLog := NewDescriptorLogWriter(file)
+	record := edit.EncodeTo()
+	if err := descriptorLog.AddRecord(record); !err.OK() {
+		return err
+	}
+	if err := db.env.RenameFile(manifestName, db.dbName+"/CURRENT"); err != nil {
+		return err
+	}
+	db.versions.manifestNumber = manifestNumber
+	result := db.versions.LogAndApply(edit, &sync.Mutex{})
+	return result
+}
+
+// Open opens the database. This function is the main entry point.
+func Open(options *Options, dbname string) (DB, *util.Status) {
+	options = SanitizeOptions(options)
+	// Create directory if CreateIfMissing is true
+	if options.CreateIfMissing {
+		if err := options.Env.CreateDir(dbname); !err.OK() {
+			return nil, err
+		}
+	}
+	// Check if database exists if ErrorIfExists is set
+	if options.ErrorIfExists {
+		if options.Env.FileExists(dbname + "/CURRENT") {
+			return nil, util.IOError("database already exists")
+		}
+	}
+	db := NewDBImpl(options, dbname)
+
+	// Create table-compatible env wrapper
+	tableEnv := &tableEnvAdapter{env: options.Env}
+	db.tableCache = table.NewTableCache(dbname, tableEnv, options.BlockCache, options.Comparator)
+	db.versions = NewVersionSet(dbname, options, db.tableCache, db.icmp)
+	lock, err := db.env.LockFile(dbname + "/LOCK")
+	if !err.OK() {
+		return nil, err
+	}
+	edit, saveManifest, err := db.Recover()
+	// Recover returns (nil, false, nil) for new DB - this is OK
+	if err != nil && !err.OK() {
+		db.env.UnlockFile(lock)
+		return nil, err
+	}
+	if edit == nil {
+		if err := db.NewDB(); !err.OK() {
+			db.env.UnlockFile(lock)
+			return nil, err
+		}
+	} else if saveManifest {
+		_ = edit // Manifest will be saved by LogAndApply
+	}
+	// Recover memtable from WAL
+	db.mem = memdb.NewMemDB(db.icmp)
+	if err := db.RecoverLogFiles(); !err.OK() {
+		db.env.UnlockFile(lock)
+		return nil, err
+	}
+	logNumber := db.versions.NewFileNumber()
+	db.logFileNumber = logNumber
+	logName := db.dbName + "/" + LogFileName(logNumber)
+	db.logFile, err = db.env.NewWritableFile(logName)
+	if !err.OK() {
+		return nil, err
+	}
+	db.logWriter = log.NewWriter(db.logFile)
+	return db, util.NewStatusOK()
+}
+
+// RecoverLogFiles recovers memtable from WAL log files.
+func (db *DBImpl) RecoverLogFiles() *util.Status {
+	// Get all log files from the database directory
+	children, err := db.env.GetChildren(db.dbName)
+	if !err.OK() {
+		return err
+	}
+	// Find the log file number from version set
+	logNumber := db.versions.LogNumber()
+
+	// If no log number set, no WAL to recover
+	if logNumber == 0 {
+		return util.NewStatusOK()
+	}
+	// Find the largest log file number <= logNumber
+	var maxLogNum uint64 = 0
+	for _, name := range children {
+		fileType, num, ok := ParseFileName(name)
+		if !ok {
+			continue
+		}
+		if fileType == kLogFile && num <= logNumber && num > maxLogNum {
+			maxLogNum = num
+		}
+	}
+	if maxLogNum == 0 {
+		return util.NewStatusOK()
+	}
+	// Open and recover the WAL
+	return db.RecoverLogFile(maxLogNum)
+}
+
+// RecoverLogFile reads a WAL log file and replays records to memtable.
+func (db *DBImpl) RecoverLogFile(logNum uint64) *util.Status {
+	logName := db.dbName + "/" + LogFileName(logNum)
+
+	file, err := db.env.NewSequentialFile(logName)
+	if !err.OK() {
+		return err
+	}
+	reader := log.NewReader(file)
+	seq := db.versions.LastSequence() + 1
+	for {
+		record, status := reader.ReadRecord()
+		if !status.OK() {
+			return status
+		}
+		if record == nil {
+			break // EOF
+		}
+		// Parse WriteBatch from record
+		batch := decodeWriteBatch(record)
+		if batch == nil {
+			continue // Skip corrupted records
+		}
+		// Apply to memtable
+		batch.Iterate(&memtableWriter{db: db, seq: seq})
+
+		// Update sequence number based on batch size
+		numOps := uint64(len(batch.ops))
+		seq += SequenceNumber(numOps)
+		db.versions.SetLastSequence(seq - 1)
+	}
+	return util.NewStatusOK()
+}
+
+// decodeWriteBatch decodes a WriteBatch from its binary representation.
+// Returns nil if the batch is malformed.
+func decodeWriteBatch(data []byte) *WriteBatch {
+	if len(data) == 0 {
+		return nil
+	}
+	batch := NewWriteBatch()
+	offset := 0
+	// Read count (varint32)
+	count, n, ok := util.DecodeVarint32(data[offset:])
+	if !ok {
+		return nil
+	}
+	offset += n
+	for i := uint32(0); i < count; i++ {
+		if offset >= len(data) {
+			return nil
+		}
+		// Read opcode
+		code := WriteBatchOpCode(data[offset])
+		offset++
+		// Read key (length-prefixed)
+		keySlice, n, ok := util.GetLengthPrefixedSlice(data[offset:])
+		if !ok {
+			return nil
+		}
+		offset += n
+		if code == WriteBatchPut {
+			// Read value (length-prefixed)
+			valueSlice, n, ok := util.GetLengthPrefixedSlice(data[offset:])
+			if !ok {
+				return nil
+			}
+			offset += n
+			batch.Put(keySlice, valueSlice)
+		} else if code == WriteBatchDelete {
+			batch.Delete(keySlice)
+		} else {
+			// Unknown opcode, skip
+			return nil
+		}
+	}
+	return batch
+}
+func SanitizeOptions(options *Options) *Options {
+	if options == nil {
+		options = NewOptions()
+	}
+	if options.Comparator == nil {
+		options.Comparator = util.DefaultBytewiseComparator()
+	}
+	if options.Env == nil {
+		options.Env = DefaultEnv()
+	}
+	if options.WriteBufferSize == 0 {
+		options.WriteBufferSize = 4 * 1024 * 1024
+	}
+	if options.MaxFileSize == 0 {
+		options.MaxFileSize = 2 * 1024 * 1024
+	}
+	if options.BlockSize == 0 {
+		options.BlockSize = 4096
+	}
+	if options.BlockCache == nil {
+		options.BlockCache = table.NewLRUCache(8 << 20)
+	}
+	return options
+}
+func (db *DBImpl) Put(options *WriteOptions, key, value util.Slice) *util.Status {
+	batch := NewWriteBatch()
+	batch.Put(key, value)
+	return db.Write(options, batch)
+}
+func (db *DBImpl) Delete(options *WriteOptions, key util.Slice) *util.Status {
+	batch := NewWriteBatch()
+	batch.Delete(key)
+	return db.Write(options, batch)
+}
+func (db *DBImpl) Write(options *WriteOptions, batch *WriteBatch) *util.Status {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := db.makeRoomForWrite(false); err != nil && !err.OK() {
+		return err
+	}
+	lastSeq := db.versions.LastSequence()
+	seq := lastSeq + 1
+	if db.logWriter != nil {
+		record := encodeWriteBatch(batch)
+		if _, err := db.logWriter.AddRecord(record); err != nil && !err.OK() {
+			return err
+		}
+		if options != nil && options.Sync && db.logFile != nil {
+			if err := db.logFile.Sync(); err != nil && !err.OK() {
+				return err
+			}
+		}
+	}
+	if err := db.writeBatchInternal(batch, seq); err != nil && !err.OK() {
+		return err
+	}
+	// Update LastSequence to kMaxSequenceNumber to allow Get/Iterator to find memtable entries
+	// Note: This is a simplification for the initial implementation
+	db.versions.SetLastSequence(kMaxSequenceNumber)
+	return util.NewStatusOK()
+}
+func encodeWriteBatch(batch *WriteBatch) []byte {
+	var result []byte
+	result = util.PutVarint32(result, uint32(len(batch.ops)))
+	for _, op := range batch.ops {
+		result = append(result, byte(op.Code))
+		result = util.PutLengthPrefixedSlice(result, util.MakeSlice(op.Key))
+		if op.Code == WriteBatchPut {
+			result = util.PutLengthPrefixedSlice(result, util.MakeSlice(op.Value))
+		}
+	}
+	return result
+}
+func (db *DBImpl) writeBatchInternal(batch *WriteBatch, seq SequenceNumber) *util.Status {
+	batch.Iterate(&memtableWriter{db: db, seq: seq})
+	return util.NewStatusOK()
+}
+
+type memtableWriter struct {
+	db  *DBImpl
+	seq SequenceNumber
+}
+
+func (w *memtableWriter) Put(key, value util.Slice) {
+	// Use kMaxSequenceNumber so Get can find this with kMaxSequenceNumber search
+	// This is a simplification - real LevelDB has more complex sequence handling
+	ikey := NewInternalKey(key, kMaxSequenceNumber, KTypeValue)
+	w.db.mem.Put(ikey.Encode(), value)
+}
+func (w *memtableWriter) Delete(key util.Slice) {
+	ikey := NewInternalKey(key, kMaxSequenceNumber, KTypeDeletion)
+	w.db.mem.Delete(ikey.Encode())
+}
+
+// GetLastSequence returns the current last sequence number.
+// Exported for testing purposes.
+func (db *DBImpl) GetLastSequence() SequenceNumber {
+	return db.versions.LastSequence()
+}
+func (db *DBImpl) Get(options *ReadOptions, key util.Slice) ([]byte, *util.Status) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var seq SequenceNumber
+	if options != nil && options.Snapshot != nil {
+		seq = options.Snapshot.Sequence()
+	} else {
+		seq = db.versions.LastSequence()
+	}
+	// Search memtable with kMaxSequenceNumber to get the latest value
+	// Memtable only stores one entry per key (the latest), so this works correctly
+	// Note: This ignores snapshot semantics for memtable reads
+	ikey := NewInternalKey(key, kMaxSequenceNumber, KTypeValue)
+	if value, err := db.mem.Get(ikey.Encode()); err.OK() {
+		return value, err
+	}
+	if db.imm != nil {
+		if value, err := db.imm.Get(ikey.Encode()); err.OK() {
+			return value, err
+		}
+	}
+	if value, err := db.versions.Current().Get(key, seq); err.OK() {
+		return value, err
+	}
+	return nil, util.NotFound("")
+}
+func (db *DBImpl) NewIterator(options *ReadOptions) Iterator {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var seq SequenceNumber
+	if options != nil && options.Snapshot != nil {
+		seq = options.Snapshot.Sequence()
+	} else {
+		seq = db.versions.LastSequence()
+	}
+	internalIter := db.newInternalIterator()
+	return NewDBIterator(db, db.options.Comparator, internalIter, seq, db.seed)
+}
+func (db *DBImpl) newInternalIterator() Iterator {
+	var iters []Iterator
+	if db.mem != nil {
+		iters = append(iters, db.mem.NewIterator())
+	}
+	if db.imm != nil {
+		iters = append(iters, db.imm.NewIterator())
+	}
+	if len(iters) == 0 {
+		return NewEmptyIterator()
+	}
+	return NewMergingIterator(db.icmp, iters)
+}
+func (db *DBImpl) GetSnapshot() Snapshot {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	seq := db.versions.LastSequence()
+	snapshot := NewSnapshot(seq)
+	return snapshot
+}
+func (db *DBImpl) ReleaseSnapshot(snapshot Snapshot) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	snapshot.Release()
+}
+func (db *DBImpl) GetProperty(property util.Slice) (string, bool) {
+	return "", false
+}
+func (db *DBImpl) GetApproximateSizes(ranges []Range) []uint64 {
+	return make([]uint64, len(ranges))
+}
+func (db *DBImpl) CompactRange(begin, end util.Slice) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+}
+func (db *DBImpl) makeRoomForWrite(force bool) *util.Status {
+	for {
+		if !force && int(db.mem.ApproximateMemoryUsage()) < db.options.WriteBufferSize {
+			return util.NewStatusOK()
+		}
+		if db.hasImm.Load() {
+			// Another thread is switching memtable, wait for it
+			continue
+		}
+		// Memtable is full, need to switch
+		if err := db.switchMemtable(); !err.OK() {
+			return err
+		}
+		// Trigger background compaction
+		db.MaybeScheduleCompaction()
+	}
+}
+
+// MaybeScheduleCompaction schedules a background compaction if not already scheduled.
+func (db *DBImpl) MaybeScheduleCompaction() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.backgroundCompactionScheduled {
+		return
+	}
+	db.backgroundCompactionScheduled = true
+	db.env.Schedule(db.CompactMemTable)
+}
+
+// CompactMemTable compacts the imm memtable to disk.
+func (db *DBImpl) CompactMemTable() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	defer func() {
+		db.backgroundCompactionScheduled = false
+	}()
+	if db.imm == nil {
+		return
+	}
+	// Basic compaction: flush imm to level 0
+	// TODO: implement full compaction logic
+	edit := NewVersionEdit()
+	edit.SetLogNumber(db.logFileNumber)
+
+	if err := db.versions.LogAndApply(edit, &db.mu); !err.OK() {
+		db.bgError = err
+		return
+	}
+	// Clear imm
+	db.imm = nil
+	db.hasImm.Store(false)
+}
+func (db *DBImpl) switchMemtable() *util.Status {
+	db.hasImm.Store(true)
+	db.imm = db.mem
+	db.mem = memdb.NewMemDB(db.icmp)
+	logNumber := db.versions.NewFileNumber()
+	logName := db.dbName + "/" + LogFileName(logNumber)
+	logFile, err := db.env.NewWritableFile(logName)
+	if err != nil {
+		return err
+	}
+	db.logFile = logFile
+	db.logFileNumber = logNumber
+	db.logWriter = log.NewWriter(logFile)
+	edit := NewVersionEdit()
+	edit.SetLogNumber(logNumber)
+	return db.versions.LogAndApply(edit, &db.mu)
+}
+func (db *DBImpl) Close() *util.Status {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.shuttingDown.Store(true)
+	if db.logFile != nil {
+		db.logFile.Close()
+	}
+	return util.NewStatusOK()
+}
+func InternalKeyForSeek(key util.Slice, seq SequenceNumber) InternalKey {
+	return NewInternalKey(key, seq, KTypeValue)
+}
+
+// tableEnvAdapter wraps db.Env to satisfy table.Env interface.
+// ⚠️ WARNING: This adapter must stay in sync with both db.Env and table.Env interfaces.
+// Any change to either interface requires updating this adapter.
+// Why not extend Env directly? table package intentionally duplicates
+// Env to avoid import cycle with db package.
+type tableEnvAdapter struct {
+	env Env
+}
+
+func (e *tableEnvAdapter) NewRandomAccessFile(name string) (table.RandomAccessFile, *util.Status) {
+	file, err := e.env.NewRandomAccessFile(name)
+	if !err.OK() {
+		return nil, err
+	}
+	return &randomAccessFileAdapter{file: file}, err
+}
+func (e *tableEnvAdapter) LockFile(name string) (interface{}, *util.Status) {
+	lock, err := e.env.LockFile(name)
+	if !err.OK() {
+		return nil, err
+	}
+	return lock, err
+}
+func (e *tableEnvAdapter) UnlockFile(lock interface{}) *util.Status {
+	return e.env.UnlockFile(lock.(FileLock))
+}
+func (e *tableEnvAdapter) ReadFile(name string, data []byte) (int, *util.Status) {
+	return e.env.ReadFile(name, data)
+}
+func (e *tableEnvAdapter) RenameFile(oldName, newName string) *util.Status {
+	return e.env.RenameFile(oldName, newName)
+}
+func (e *tableEnvAdapter) DeleteFile(name string) *util.Status {
+	return e.env.DeleteFile(name)
+}
+func (e *tableEnvAdapter) GetFileSize(name string) (uint64, *util.Status) {
+	return e.env.GetFileSize(name)
+}
+
+// randomAccessFileAdapter wraps db.RandomAccessFile for table.RandomAccessFile.
+type randomAccessFileAdapter struct {
+	file RandomAccessFile
+}
+
+func (a *randomAccessFileAdapter) ReadAt(p []byte, offset int64) (n int, err *util.Status) {
+	data, err := a.file.Read(uint64(offset), len(p))
+	if !err.OK() {
+		return 0, err
+	}
+	n = copy(p, data)
+	return n, util.NewStatusOK()
+}

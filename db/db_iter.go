@@ -1,0 +1,285 @@
+package db
+
+import (
+	"github.com/akzj/go-leveldb/util"
+)
+
+// Direction is the iteration direction.
+type Direction int
+
+const (
+	kForward  Direction = 0
+	kReverse Direction = 1
+)
+
+// DBIter wraps an internal iterator to provide user-facing Iterator interface.
+// Combines multiple entries for the same user key (different sequences) into
+// a single entry.
+// Invariant: direction-aware - forward uses current position, backward saves key.
+type DBIter struct {
+	db               *DBImpl
+	userComparator   util.Comparator
+	iter             Iterator
+	sequence         SequenceNumber
+	direction        Direction
+	valid            bool
+	status_          *util.Status
+	savedKey         util.Slice
+	savedValue       []byte
+}
+
+// NewDBIterator creates a new DB iterator.
+func NewDBIterator(db *DBImpl, cmp util.Comparator, iter Iterator, seq SequenceNumber, seed uint32) Iterator {
+	return &DBIter{
+		db:             db,
+		userComparator: cmp,
+		iter:           iter,
+		sequence:       seq,
+		direction:      kForward,
+		valid:          false,
+		status_:        util.NewStatusOK(),
+	}
+}
+
+// Valid implements Iterator.
+func (i *DBIter) Valid() bool {
+	return i.valid
+}
+
+// SeekToFirst implements Iterator.
+func (i *DBIter) SeekToFirst() {
+	i.direction = kForward
+	i.clearSavedValue()
+	i.savedKey.Clear()
+	i.iter.SeekToFirst()
+	i.findNextUserEntry(false, nil)
+}
+
+// SeekToLast implements Iterator.
+func (i *DBIter) SeekToLast() {
+	i.direction = kReverse
+	i.clearSavedValue()
+	i.savedKey.Clear()
+	i.iter.SeekToLast()
+	i.findPrevUserEntry()
+}
+
+// Seek implements Iterator.
+func (i *DBIter) Seek(target util.Slice) {
+	i.direction = kForward
+	i.clearSavedValue()
+	i.savedKey.Clear()
+
+	// Create seek key with our sequence number
+	seekKey := make([]byte, 0, target.Size()+8)
+	seekKey = AppendInternalKey(seekKey, &ParsedInternalKey{
+		UserKey:  target,
+		Sequence: i.sequence,
+		Type:     kValueTypeForSeek,
+	})
+
+	i.iter.Seek(util.MakeSlice(seekKey))
+	i.findNextUserEntry(false, nil)
+}
+
+// Next implements Iterator.
+func (i *DBIter) Next() {
+	assert(i.valid, "iterator not valid")
+
+	if i.direction == kReverse {
+		// Switching from reverse to forward
+		i.direction = kForward
+		// iter_ is positioned just before entries for saved_key_
+		if !i.iter.Valid() {
+			i.iter.SeekToFirst()
+		} else {
+			i.iter.Next()
+		}
+		if !i.iter.Valid() {
+			i.valid = false
+			i.savedKey.Clear()
+			return
+		}
+	} else {
+		// Store current key to skip past
+		i.saveKey(i.iter.Key())
+		// Move to next
+		i.iter.Next()
+		if !i.iter.Valid() {
+			i.valid = false
+			i.savedKey.Clear()
+			return
+		}
+	}
+
+	i.findNextUserEntry(true, &i.savedKey)
+}
+
+// Prev implements Iterator.
+func (i *DBIter) Prev() {
+	assert(i.valid, "iterator not valid")
+
+	if i.direction == kForward {
+		// Switching from forward to reverse
+		i.saveKey(i.iter.Key())
+		i.iter.Prev()
+		if !i.iter.Valid() {
+			i.valid = false
+			i.savedKey.Clear()
+			return
+		}
+	}
+
+	i.findPrevUserEntry()
+}
+
+// Key implements Iterator.
+func (i *DBIter) Key() util.Slice {
+	assert(i.valid, "iterator not valid")
+	if i.direction == kForward {
+		return ExtractUserKey(i.iter.Key())
+	}
+	return i.savedKey
+}
+
+// Value implements Iterator.
+func (i *DBIter) Value() util.Slice {
+	assert(i.valid, "iterator not valid")
+	if i.direction == kForward {
+		return i.iter.Value()
+	}
+	return util.MakeSlice(i.savedValue)
+}
+
+// Status implements Iterator.
+func (i *DBIter) Status() *util.Status {
+	if !i.status_.OK() {
+		return i.status_
+	}
+	return i.iter.Status()
+}
+
+// Release implements Iterator.
+func (i *DBIter) Release() {
+	i.iter.Release()
+	i.iter = nil
+}
+
+// findNextUserEntry advances to the next user key entry.
+// If skipping is true, skips entries <= the key in skip.
+func (i *DBIter) findNextUserEntry(skipping bool, skip *util.Slice) {
+	for i.iter.Valid() {
+		ikey := &ParsedInternalKey{}
+		if !parseInternalKey(i.iter.Key(), ikey) {
+			i.status_ = util.Corruption("corrupted internal key in DBIter")
+			i.valid = false
+			return
+		}
+
+		if ikey.Sequence <= i.sequence {
+			switch ikey.Type {
+			case KTypeDeletion:
+				// Skip all entries for this key
+				i.saveKey(ikey.UserKey)
+				skipping = true
+			case KTypeValue:
+				if skipping && skip != nil && i.userComparator.Compare(ikey.UserKey, *skip) <= 0 {
+					// Entry is hidden
+				} else {
+					i.valid = true
+					i.savedKey.Clear()
+					return
+				}
+			}
+		}
+		i.iter.Next()
+	}
+
+	i.valid = false
+	i.savedKey.Clear()
+}
+
+// findPrevUserEntry moves backwards to find the previous user key entry.
+func (i *DBIter) findPrevUserEntry() {
+	valueType := KTypeDeletion
+
+	for i.iter.Valid() {
+		ikey := &ParsedInternalKey{}
+		if !parseInternalKey(i.iter.Key(), ikey) {
+			i.status_ = util.Corruption("corrupted internal key in DBIter")
+			i.valid = false
+			return
+		}
+
+		if ikey.Sequence <= i.sequence {
+			if valueType != KTypeDeletion && i.userComparator.Compare(ikey.UserKey, i.savedKey) < 0 {
+				// Found non-deleted value for previous key
+				break
+			}
+			valueType = ikey.Type
+			if valueType == KTypeDeletion {
+				i.savedKey.Clear()
+				i.savedValue = nil
+			} else {
+				i.saveKey(ikey.UserKey)
+				i.savedValue = i.iter.Value().Data()
+			}
+		}
+		i.iter.Prev()
+	}
+
+	if valueType == KTypeDeletion {
+		i.valid = false
+		i.savedKey.Clear()
+		i.savedValue = nil
+	} else {
+		i.valid = true
+	}
+	i.direction = kReverse
+}
+
+// parseInternalKey is a helper to parse an internal key.
+func parseInternalKey(k util.Slice, result *ParsedInternalKey) bool {
+	n := k.Size()
+	if n < 8 {
+		return false
+	}
+	offset := n - 8
+	// Decode sequence and type from last 8 bytes
+	// Format: [user_key][seq (7 bytes big-endian)][type (1 byte)]
+	seq := uint64(0)
+	for i := 0; i < 7; i++ {
+		seq = (seq << 8) | uint64(k.Data()[offset+i])
+	}
+	c := uint8(k.Data()[offset+7])
+	result.Sequence = SequenceNumber(seq)
+	result.Type = ValueType(c)
+	result.UserKey = util.MakeSlice(k.Data()[:offset])
+	return c <= uint8(KTypeValue)
+}
+
+// saveKey copies key into savedKey.
+func (i *DBIter) saveKey(k util.Slice) {
+	i.savedKey = util.MakeSlice(make([]byte, k.Size()))
+	copy(i.savedKey.Data(), k.Data())
+}
+
+// clearSavedValue clears savedValue if it's too large.
+// Only accesses iter.Value() if the iterator is valid.
+func (i *DBIter) clearSavedValue() {
+	if cap(i.savedValue) > 1048576 {
+		i.savedValue = nil
+	}
+	if i.iter != nil && i.iter.Valid() {
+		i.savedValue = append(i.savedValue[:0], i.iter.Value().Data()...)
+	} else {
+		i.savedValue = nil
+	}
+}
+
+// assert panics if cond is false.
+func assert(cond bool, msg string) {
+	if !cond {
+		panic(msg)
+	}
+}
