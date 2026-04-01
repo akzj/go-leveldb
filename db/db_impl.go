@@ -630,7 +630,26 @@ func (db *DBImpl) MaybeScheduleCompaction() {
 	db.env.Schedule(db.CompactMemTable)
 }
 
-// CompactMemTable compacts the imm memtable to disk.
+// CompactMemTable implements memtable → SSTable flush.
+// Design Contract (reference: leveldb_cpp_code_readonly/db/version_set.cc):
+//   Input: db.imm contains sorted key-value pairs from memtable
+//   Output: New SSTable file in level 0
+//   Side effects:
+//     - New SSTable file created in db directory
+//     - VersionEdit contains AddFile record for new SSTable
+//     - manifest synced via LogAndApply
+//     - db.imm set to nil on success
+//
+// Implementation steps:
+//   1. Get file number: db.versions.NewFileNumber()
+//   2. Get key range: iterate imm to find smallest/largest keys
+//   3. Build SSTable: table.BuildTable(env, dbName, fileNum, opts, iter)
+//   4. Add to VersionEdit: edit.AddFile(0, FileMetaData{...})
+//   5. Apply edit: db.versions.LogAndApply(edit, &db.mu)
+//   6. Clear imm: db.imm = nil (only after LogAndApply succeeds)
+//
+// Why BuildTable? Creates sorted SSTable from memdb iterator.
+// Why not just LogAndApply? Current code skips step 3 - no SSTable is built.
 func (db *DBImpl) CompactMemTable() {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -640,16 +659,52 @@ func (db *DBImpl) CompactMemTable() {
 	if db.imm == nil {
 		return
 	}
-	// Basic compaction: flush imm to level 0
-	// TODO: implement full compaction logic
+
+	// Step 1: Get file number
+	fileNumber := db.versions.NewFileNumber()
+
+	// Step 2: Get key range by iterating imm
+	imm := db.imm
+	var smallest, largest InternalKey
+	iter := imm.NewIterator()
+	iter.SeekToFirst()
+	if iter.Valid() {
+		smallest = InternalKey{rep: iter.Key().Data()}
+	}
+	iter.SeekToLast()
+	if iter.Valid() {
+		largest = InternalKey{rep: iter.Key().Data()}
+	}
+	iter.Release()
+
+	// Step 3: Build SSTable from imm
+	builderOpts := &table.TableBuilderOptions{
+		Comparator: db.icmp,
+	}
+	tableEnv := &tableEnvAdapter{env: db.env}
+	fileSize, buildStatus := table.BuildTable(tableEnv, db.dbName, fileNumber, builderOpts, imm.NewIterator())
+	if !buildStatus.OK() {
+		db.bgError = buildStatus
+		return
+	}
+
+	// Step 4: Add to VersionEdit
 	edit := NewVersionEdit()
 	edit.SetLogNumber(db.logFileNumber)
+	edit.AddFile(0, FileMetaData{
+		Number:   fileNumber,
+		FileSize: fileSize,
+		Smallest: smallest,
+		Largest:  largest,
+	})
 
+	// Step 5: Apply edit
 	if err := db.versions.LogAndApply(edit, &db.mu); !err.OK() {
 		db.bgError = err
 		return
 	}
-	// Clear imm
+
+	// Step 6: Clear imm (only after LogAndApply succeeds)
 	db.imm = nil
 	db.hasImm.Store(false)
 }

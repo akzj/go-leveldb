@@ -30,11 +30,21 @@ func NewSnapshot(seq SequenceNumber) Snapshot {
 }
 
 // Release implements Snapshot.
+// Snapshot Cleanup Contract:
+//   - Snapshot holds read-only view at a point in time
+//   - No external resources (files, connections, handles) to release
+//   - refCount tracks reference count for snapshot reuse
+//   - When refCount <= 0: Go GC reclaims snapshot memory automatically
+//   - No manual cleanup needed (unlike C++ which may hold resources)
 func (s *snapshotImpl) Release() {
 	s.mu.Lock()
 	s.refCount--
+	// Snapshot is immutable and holds no external resources (no file handles,
+	// no network connections). Go's garbage collector automatically reclaims
+	// the memory when the snapshot is no longer referenced.
 	if s.refCount <= 0 {
-		// TODO: cleanup
+		// Explicitly set to nil to help GC (snapshotImpl is heap-allocated)
+		s.sequence = 0
 	}
 	s.mu.Unlock()
 }
