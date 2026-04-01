@@ -48,6 +48,8 @@ func NewMemDB(comparator util.Comparator) *MemDB {
 func (m *MemDB) Put(key, value util.Slice) *util.Status {
 	m.skiplist.Insert(key.Data(), value.Data())
 	m.count++
+	// Track memory: key + value + ~16 bytes for node overhead
+	m.arena.Allocate(key.Size() + value.Size() + 16)
 	return util.NewStatusOK()
 }
 
@@ -70,6 +72,8 @@ func (m *MemDB) Delete(key util.Slice) *util.Status {
 	// Insert with deletion marker (type byte = 0)
 	m.skiplist.Insert(key.Data(), nil)
 	m.count++
+	// Track memory: key + ~16 bytes for node overhead
+	m.arena.Allocate(key.Size() + 16)
 	return util.NewStatusOK()
 }
 

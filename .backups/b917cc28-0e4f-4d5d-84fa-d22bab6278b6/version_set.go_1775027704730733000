@@ -1,7 +1,6 @@
 package db
 
 import (
-	"strconv"
 	"sync"
 
 	"github.com/akzj/go-leveldb/table"
@@ -720,15 +719,5 @@ func (vs *VersionSet) ApproximateOffsetOf(v *Version, key InternalKey) uint64 {
 // Used by GetProperty("leveldb.sstables").
 // Format: per-level listing with file number, size, and key range.
 func (v *Version) DebugString() string {
-	var r string
-	for level := 0; level < kNumLevels; level++ {
-		r += "--- level " + strconv.Itoa(level) + " ---\n"
-		files := v.files[level]
-		for i := 0; i < len(files); i++ {
-			r += " " + strconv.FormatUint(files[i].Number, 10)
-			r += ":" + strconv.FormatUint(files[i].FileSize, 10)
-			r += "[" + files[i].Smallest.UserKey().String() + " .. " + files[i].Largest.UserKey().String() + "]\n"
-		}
-	}
-	return r
+	panic("TODO: implement Version.DebugString")
 }

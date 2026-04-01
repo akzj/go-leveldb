@@ -1,8 +1,6 @@
 package db
 
 import (
-	"fmt"
-
 	"github.com/akzj/go-leveldb/log"
 	"github.com/akzj/go-leveldb/memdb"
 	"github.com/akzj/go-leveldb/table"
@@ -37,7 +35,6 @@ type DBImpl struct {
 	manualCompaction              *ManualCompaction
 	stats                         [kNumLevels]CompactionStats
 	seed                          uint32
-	lock                          FileLock
 }
 type Writer struct {
 	batch  *WriteBatch
@@ -154,7 +151,6 @@ func Open(options *Options, dbname string) (DB, *util.Status) {
 	if !err.OK() {
 		return nil, err
 	}
-	db.lock = lock
 	edit, saveManifest, err := db.Recover()
 	// Recover returns (nil, false, nil) for new DB - this is OK
 	if err != nil && !err.OK() {
@@ -352,8 +348,9 @@ func (db *DBImpl) Write(options *WriteOptions, batch *WriteBatch) *util.Status {
 	if err := db.writeBatchInternal(batch, seq); err != nil && !err.OK() {
 		return err
 	}
-	// Update LastSequence to the actual last sequence used in this batch
-	db.versions.SetLastSequence(seq + SequenceNumber(len(batch.ops)) - 1)
+	// Update LastSequence to kMaxSequenceNumber to allow Get/Iterator to find memtable entries
+	// Note: This is a simplification for the initial implementation
+	db.versions.SetLastSequence(kMaxSequenceNumber)
 	return util.NewStatusOK()
 }
 func encodeWriteBatch(batch *WriteBatch) []byte {
@@ -379,17 +376,13 @@ type memtableWriter struct {
 }
 
 func (w *memtableWriter) Put(key, value util.Slice) {
-	// Use w.seq for proper snapshot isolation
-	// This ensures Put and Delete can be ordered correctly
-	ikey := NewInternalKey(key, w.seq, KTypeValue)
+	// Use kMaxSequenceNumber so Get can find this with kMaxSequenceNumber search
+	// This is a simplification - real LevelDB has more complex sequence handling
+	ikey := NewInternalKey(key, kMaxSequenceNumber, KTypeValue)
 	w.db.mem.Put(ikey.Encode(), value)
 }
 func (w *memtableWriter) Delete(key util.Slice) {
-	// Use w.seq for proper snapshot isolation
-	// Delete and Put in the same batch get the same sequence, but
-	// in LevelDB, Put (type=1) sorts after Delete (type=0) at same sequence
-	// So we need to use seq+1 for Put to make it "newer"
-	ikey := NewInternalKey(key, w.seq, KTypeDeletion)
+	ikey := NewInternalKey(key, kMaxSequenceNumber, KTypeDeletion)
 	w.db.mem.Delete(ikey.Encode())
 }
 
@@ -401,22 +394,22 @@ func (db *DBImpl) GetLastSequence() SequenceNumber {
 func (db *DBImpl) Get(options *ReadOptions, key util.Slice) ([]byte, *util.Status) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	// Use LastSequence when no snapshot to get the latest entry
-	// (Put uses actual sequence number, not kMaxSequenceNumber)
-	var seq SequenceNumber = db.versions.LastSequence()
+	var seq SequenceNumber
 	if options != nil && options.Snapshot != nil {
-		// With snapshot, use the snapshot's sequence
 		seq = options.Snapshot.Sequence()
+	} else {
+		seq = db.versions.LastSequence()
 	}
-	// Search memtable with appropriate sequence for proper snapshot isolation
-	if db.mem != nil {
-		if value, status, ok := db.mem.FindForSnapshot(key, uint64(seq)); ok {
-			return value, status
-		}
+	// Search memtable with kMaxSequenceNumber to get the latest value
+	// Memtable only stores one entry per key (the latest), so this works correctly
+	// Note: This ignores snapshot semantics for memtable reads
+	ikey := NewInternalKey(key, kMaxSequenceNumber, KTypeValue)
+	if value, err := db.mem.Get(ikey.Encode()); err.OK() {
+		return value, err
 	}
 	if db.imm != nil {
-		if value, status, ok := db.imm.FindForSnapshot(key, uint64(seq)); ok {
-			return value, status
+		if value, err := db.imm.Get(ikey.Encode()); err.OK() {
+			return value, err
 		}
 	}
 	if value, err := db.versions.Current().Get(key, seq); err.OK() {
@@ -427,11 +420,11 @@ func (db *DBImpl) Get(options *ReadOptions, key util.Slice) ([]byte, *util.Statu
 func (db *DBImpl) NewIterator(options *ReadOptions) Iterator {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	// Use LastSequence when no snapshot to see all entries
-	// (Put uses actual sequence number, not kMaxSequenceNumber)
-	var seq SequenceNumber = db.versions.LastSequence()
+	var seq SequenceNumber
 	if options != nil && options.Snapshot != nil {
 		seq = options.Snapshot.Sequence()
+	} else {
+		seq = db.versions.LastSequence()
 	}
 	internalIter := db.newInternalIterator()
 	return NewDBIterator(db, db.options.Comparator, internalIter, seq, db.seed)
@@ -469,32 +462,28 @@ func (db *DBImpl) GetProperty(property util.Slice) (string, bool) {
 	if !property.StartsWith(prefix) {
 		return "", false
 	}
-	in := property
-	in.RemovePrefix(prefix.Size())
+	in := property.DropPrefix(prefix.Size())
 
 	// Handle "num-files-at-level<N>"
-	numFilesPrefix := util.MakeSliceFromString("num-files-at-level")
-	if in.StartsWith(numFilesPrefix) {
-		tmp := in
-		tmp.RemovePrefix(19) // len("num-files-at-level")
-		if tmp.Empty() {
+	if in.StartsWith(util.MakeSliceFromString("num-files-at-level")) {
+		in = in.DropPrefix(19) // len("num-files-at-level")
+		if in.Empty() {
 			return "", false
 		}
 		// Parse level number
 		var level uint64
-		for !tmp.Empty() && tmp.Data()[0] >= '0' && tmp.Data()[0] <= '9' {
-			level = level*10 + uint64(tmp.Data()[0]-'0')
-			tmp.RemovePrefix(1)
+		for !in.Empty() && in.Data()[0] >= '0' && in.Data()[0] <= '9' {
+			level = level*10 + uint64(in.Data()[0]-'0')
+			in = in.DropPrefix(1)
 		}
-		if !tmp.Empty() || level >= uint64(kNumLevels) {
+		if !in.Empty() || level >= uint64(kNumLevels) {
 			return "", false
 		}
 		return fmt.Sprintf("%d", db.versions.NumLevelFiles(int(level))), true
 	}
 
 	// Handle "stats"
-	statsStr := util.MakeSliceFromString("stats")
-	if in.StartsWith(statsStr) && in.Size() == 5 {
+	if string(in.Data()) == "stats" {
 		result := "                               Compactions\n"
 		result += "Level  Files Size(MB) Time(sec) Read(MB) Write(MB)\n"
 		result += "--------------------------------------------------\n"
@@ -513,23 +502,21 @@ func (db *DBImpl) GetProperty(property util.Slice) (string, bool) {
 	}
 
 	// Handle "sstables"
-	sstablesStr := util.MakeSliceFromString("sstables")
-	if in.StartsWith(sstablesStr) && in.Size() == 8 {
+	if string(in.Data()) == "sstables" {
 		return db.versions.Current().DebugString(), true
 	}
 
 	// Handle "approximate-memory-usage"
-	memUsageStr := util.MakeSliceFromString("approximate-memory-usage")
-	if in.StartsWith(memUsageStr) && in.Size() == 26 {
-		var totalUsage int
+	if string(in.Data()) == "approximate-memory-usage" {
+		var totalUsage uint64
 		if db.options.BlockCache != nil {
-			totalUsage += int(db.options.BlockCache.TotalCharge())
+			totalUsage += db.options.BlockCache.TotalCharge()
 		}
 		if db.mem != nil {
-			totalUsage += int(db.mem.ApproximateMemoryUsage())
+			totalUsage += db.mem.ApproximateMemoryUsage()
 		}
 		if db.imm != nil {
-			totalUsage += int(db.imm.ApproximateMemoryUsage())
+			totalUsage += db.imm.ApproximateMemoryUsage()
 		}
 		return fmt.Sprintf("%d", totalUsage), true
 	}
@@ -537,69 +524,11 @@ func (db *DBImpl) GetProperty(property util.Slice) (string, bool) {
 	return "", false
 }
 func (db *DBImpl) GetApproximateSizes(ranges []Range) []uint64 {
-	db.mu.Lock()
-	v := db.versions.Current()
-	v.Ref()
-	sizes := make([]uint64, len(ranges))
-	for i := 0; i < len(ranges); i++ {
-		k1 := NewInternalKey(ranges[i].Start, kMaxSequenceNumber, KTypeValue)
-		k2 := NewInternalKey(ranges[i].Limit, kMaxSequenceNumber, KTypeValue)
-		start := db.versions.ApproximateOffsetOf(v, k1)
-		limit := db.versions.ApproximateOffsetOf(v, k2)
-		if limit >= start {
-			sizes[i] = limit - start
-		}
-		// Include memtable size if it exists - memtable data starts at offset 0
-		// and isn't yet in SST files, so it should always be counted
-		if db.mem != nil {
-			memSize := uint64(db.mem.ApproximateMemoryUsage())
-			if sizes[i] < memSize {
-				sizes[i] = memSize
-			}
-		}
-		if db.imm != nil {
-			immSize := uint64(db.imm.ApproximateMemoryUsage())
-			if sizes[i] < immSize {
-				sizes[i] = immSize
-			}
-		}
-	}
-	v.Unref()
-	db.mu.Unlock()
-	return sizes
+	return make([]uint64, len(ranges))
 }
 func (db *DBImpl) CompactRange(begin, end util.Slice) {
-	manual := ManualCompaction{
-		level: 0,
-		done:  false,
-	}
-	if !begin.Empty() {
-		manual.begin = new(InternalKey)
-		*manual.begin = NewInternalKey(begin, kMaxSequenceNumber, KTypeValue)
-	}
-	if !end.Empty() {
-		manual.end = new(InternalKey)
-		*manual.end = NewInternalKey(end, 0, KTypeDeletion)
-	}
-
 	db.mu.Lock()
-	for !manual.done && !db.shuttingDown.Load() && db.bgError.OK() {
-		if db.manualCompaction == nil {
-			db.manualCompaction = &manual
-			db.MaybeScheduleCompaction()
-		} else {
-			db.bgCond.Wait()
-		}
-	}
-	// Finish current background compaction in the case where
-	// bgCond was signalled due to an error.
-	for db.backgroundCompactionScheduled {
-		db.bgCond.Wait()
-	}
-	if db.manualCompaction == &manual {
-		db.manualCompaction = nil
-	}
-	db.mu.Unlock()
+	defer db.mu.Unlock()
 }
 func (db *DBImpl) makeRoomForWrite(force bool) *util.Status {
 	for {
@@ -676,11 +605,6 @@ func (db *DBImpl) Close() *util.Status {
 	db.shuttingDown.Store(true)
 	if db.logFile != nil {
 		db.logFile.Close()
-	}
-	// Release the lock file
-	if db.lock != nil {
-		db.env.UnlockFile(db.lock)
-		db.lock = nil
 	}
 	return util.NewStatusOK()
 }

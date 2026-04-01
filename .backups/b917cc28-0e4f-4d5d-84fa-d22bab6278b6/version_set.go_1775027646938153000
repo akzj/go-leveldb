@@ -1,7 +1,6 @@
 package db
 
 import (
-	"strconv"
 	"sync"
 
 	"github.com/akzj/go-leveldb/table"
@@ -688,14 +687,13 @@ func parseFileNumber(name string) uint64 {
 // Returns: sum of file sizes for files that may contain key
 func (vs *VersionSet) ApproximateOffsetOf(v *Version, key InternalKey) uint64 {
 	result := uint64(0)
-	keyEncoded := key.Encode()
 	for level := 0; level < kNumLevels; level++ {
 		files := v.files[level]
 		for i := 0; i < len(files); i++ {
-			if vs.icmp.Compare(files[i].Largest.Encode(), keyEncoded) <= 0 {
+			if vs.icmp.Compare(&files[i].Largest, &key) <= 0 {
 				// Entire file is before "key", so just add the file size
 				result += files[i].FileSize
-			} else if vs.icmp.Compare(files[i].Smallest.Encode(), keyEncoded) > 0 {
+			} else if vs.icmp.Compare(&files[i].Smallest, &key) > 0 {
 				// Entire file is after "key", so ignore
 				if level > 0 {
 					// Files other than level 0 are sorted by meta-smallest, so
@@ -708,7 +706,7 @@ func (vs *VersionSet) ApproximateOffsetOf(v *Version, key InternalKey) uint64 {
 				// approximate offset of "key" within the table.
 				tbl, err := vs.tableCache.GetTable(files[i].Number, files[i].FileSize)
 				if err.OK() && tbl != nil {
-					result += tbl.ApproximateOffsetOf(keyEncoded)
+					result += tbl.ApproximateOffsetOf(key.Encode())
 				}
 			}
 		}
@@ -720,15 +718,5 @@ func (vs *VersionSet) ApproximateOffsetOf(v *Version, key InternalKey) uint64 {
 // Used by GetProperty("leveldb.sstables").
 // Format: per-level listing with file number, size, and key range.
 func (v *Version) DebugString() string {
-	var r string
-	for level := 0; level < kNumLevels; level++ {
-		r += "--- level " + strconv.Itoa(level) + " ---\n"
-		files := v.files[level]
-		for i := 0; i < len(files); i++ {
-			r += " " + strconv.FormatUint(files[i].Number, 10)
-			r += ":" + strconv.FormatUint(files[i].FileSize, 10)
-			r += "[" + files[i].Smallest.UserKey().String() + " .. " + files[i].Largest.UserKey().String() + "]\n"
-		}
-	}
-	return r
+	panic("TODO: implement Version.DebugString")
 }

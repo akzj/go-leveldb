@@ -203,6 +203,14 @@ func (i *DBIter) findNextUserEntry(skipping bool, skip *util.Slice) {
 func (i *DBIter) findPrevUserEntry() {
 	valueType := KTypeDeletion
 
+	fmt.Printf("DEBUG findPrevUserEntry:\n")
+	fmt.Printf("  Before: iter.Valid=%v\n", i.iter.Valid())
+	if i.iter.Valid() {
+		fmt.Printf("  Before: iter.Key=%s\n", string(i.iter.Key().Data()))
+	}
+	fmt.Printf("  Before: sequence=%d\n", i.sequence)
+	fmt.Printf("  Before: savedKey.Empty=%v\n", i.savedKey.Empty())
+
 	for i.iter.Valid() {
 		ikey := &ParsedInternalKey{}
 		if !parseInternalKey(i.iter.Key(), ikey) {
@@ -211,12 +219,15 @@ func (i *DBIter) findPrevUserEntry() {
 			return
 		}
 
+		fmt.Printf("  Loop: key=%s, seq=%d, type=%d\n", string(ikey.UserKey.Data()), ikey.Sequence, ikey.Type)
+
 		if ikey.Sequence <= i.sequence {
-			// For backward iteration, stop when we find a different user key
-			// (savedKey already has the previous key, so stop if current key differs)
-			if valueType != KTypeDeletion && !i.savedKey.Empty() && i.userComparator.Compare(ikey.UserKey, i.savedKey) < 0 {
-				// Found a different user key that's less than savedKey (going backward)
-				// This is the correct stopping point
+			check := valueType != KTypeDeletion && i.userComparator.Compare(ikey.UserKey, i.savedKey) < 0
+			fmt.Printf("    Break check: valueType!=Del=%v, Compare<0=%v, shouldBreak=%v\n", 
+				valueType != KTypeDeletion, i.userComparator.Compare(ikey.UserKey, i.savedKey) < 0, check)
+			
+			if check {
+				fmt.Printf("    BREAK!\n")
 				break
 			}
 			valueType = ikey.Type
@@ -226,11 +237,13 @@ func (i *DBIter) findPrevUserEntry() {
 			} else {
 				i.saveKey(ikey.UserKey)
 				i.savedValue = i.iter.Value().Data()
+				fmt.Printf("    Saved: key=%s, value=%s\n", string(i.savedKey.Data()), string(i.savedValue))
 			}
 		}
 		i.iter.Prev()
 	}
 
+	fmt.Printf("  After loop: valueType=%d\n", valueType)
 	if valueType == KTypeDeletion {
 		i.valid = false
 		i.savedKey.Clear()
@@ -238,7 +251,7 @@ func (i *DBIter) findPrevUserEntry() {
 	} else {
 		i.valid = true
 	}
-	i.direction = kReverse
+	fmt.Printf("  Result: valid=%v\n", i.valid)
 }
 
 // parseInternalKey is a helper to parse an internal key.

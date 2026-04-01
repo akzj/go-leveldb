@@ -1,0 +1,135 @@
+package db
+
+import (
+	"testing"
+
+	"github.com/akzj/go-leveldb/util"
+)
+
+// TestSnapshotBasic tests that a snapshot sees data as of its creation time.
+// Invariant: Writes after snapshot creation should not be visible via snapshot.
+func TestSnapshotBasic(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write initial data
+	db.Put(nil, util.MakeSlice([]byte("key1")), util.MakeSlice([]byte("value1")))
+	db.Put(nil, util.MakeSlice([]byte("key2")), util.MakeSlice([]byte("value2")))
+
+	// Create a snapshot
+	snapshot := db.GetSnapshot()
+
+	// Write more data after snapshot
+	db.Put(nil, util.MakeSlice([]byte("key3")), util.MakeSlice([]byte("value3")))
+	db.Put(nil, util.MakeSlice([]byte("key1")), util.MakeSlice([]byte("new_value1")))
+
+	// Read via snapshot - should see only the data as of snapshot creation
+	readOpts := &ReadOptions{Snapshot: snapshot}
+
+	val1, status := db.Get(readOpts, util.MakeSlice([]byte("key1")))
+	if !status.OK() {
+		t.Fatalf("Get via snapshot failed: %v", status.ToString())
+	}
+	if string(val1) != "value1" {
+		t.Errorf("Snapshot should see old value1, got %q", string(val1))
+	}
+
+	val2, status := db.Get(readOpts, util.MakeSlice([]byte("key2")))
+	if !status.OK() {
+		t.Fatalf("Get via snapshot failed: %v", status.ToString())
+	}
+	if string(val2) != "value2" {
+		t.Errorf("Snapshot should see value2, got %q", string(val2))
+	}
+
+	// key3 should not exist in snapshot
+	_, status = db.Get(readOpts, util.MakeSlice([]byte("key3")))
+	if !status.IsNotFound() {
+		t.Errorf("Snapshot should not see key3")
+	}
+
+	db.ReleaseSnapshot(snapshot)
+}
+
+// TestSnapshotIterator tests that an iterator over a snapshot sees point-in-time data.
+// Invariant: Iterator created with snapshot should not see writes after snapshot.
+func TestSnapshotIterator(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write initial data
+	for i := 0; i < 5; i++ {
+		key := util.MakeSlice([]byte("key"))
+		key.Append([]byte(byte('0' + i)))
+		val := util.MakeSlice([]byte("val"))
+		val.Append([]byte(byte('0' + i)))
+		db.Put(nil, key, val)
+	}
+
+	// Create a snapshot
+	snapshot := db.GetSnapshot()
+
+	// Write more data after snapshot
+	db.Put(nil, util.MakeSlice([]byte("newkey")), util.MakeSlice([]byte("newval")))
+
+	// Create iterator with snapshot
+	readOpts := &ReadOptions{Snapshot: snapshot}
+	iter := db.NewIterator(readOpts)
+	defer iter.Release()
+
+	// Count entries - should be 5, not 6
+	count := 0
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		count++
+	}
+
+	if count != 5 {
+		t.Errorf("Snapshot iterator should see 5 entries, got %d", count)
+	}
+
+	db.ReleaseSnapshot(snapshot)
+}
+
+// TestSnapshotMultiGet tests that multiple reads via snapshot see consistent state.
+// Invariant: All reads via same snapshot should return data from same point in time.
+func TestSnapshotMultiGet(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write initial data
+	db.Put(nil, util.MakeSlice([]byte("a")), util.MakeSlice([]byte("1")))
+	db.Put(nil, util.MakeSlice([]byte("b")), util.MakeSlice([]byte("2")))
+	db.Put(nil, util.MakeSlice([]byte("c")), util.MakeSlice([]byte("3")))
+
+	// Create a snapshot
+	snapshot := db.GetSnapshot()
+	readOpts := &ReadOptions{Snapshot: snapshot}
+
+	// Modify data after snapshot
+	db.Put(nil, util.MakeSlice([]byte("a")), util.MakeSlice([]byte("999")))
+	db.Delete(nil, util.MakeSlice([]byte("b")))
+
+	// Get multiple keys via snapshot - should all see consistent old state
+	valA, status := db.Get(readOpts, util.MakeSlice([]byte("a")))
+	if !status.OK() {
+		t.Fatalf("Get a via snapshot failed: %v", status.ToString())
+	}
+	if string(valA) != "1" {
+		t.Errorf("Snapshot should see a=1, got %q", string(valA))
+	}
+
+	valB, status := db.Get(readOpts, util.MakeSlice([]byte("b")))
+	if !status.OK() {
+		t.Fatalf("Get b via snapshot failed: %v", status.ToString())
+	}
+	if string(valB) != "2" {
+		t.Errorf("Snapshot should see b=2, got %q", string(valB))
+	}
+
+	valC, status := db.Get(readOpts, util.MakeSlice([]byte("c")))
+	if !status.OK() {
+		t.Fatalf("Get c via snapshot failed: %v", status.ToString())
+	}
+	if string(valC) != "3" {
+		t.Errorf("Snapshot should see c=3, got %q", string(valC))
+	}
+
+	db.ReleaseSnapshot(snapshot)
+}

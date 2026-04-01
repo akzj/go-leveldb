@@ -200,6 +200,8 @@ func (i *DBIter) findNextUserEntry(skipping bool, skip *util.Slice) {
 }
 
 // findPrevUserEntry moves backwards to find the previous user key entry.
+// When switching from forward direction, the internal iterator is already on the
+// previous key, so we need to process it first before checking for a different key.
 func (i *DBIter) findPrevUserEntry() {
 	valueType := KTypeDeletion
 
@@ -212,13 +214,6 @@ func (i *DBIter) findPrevUserEntry() {
 		}
 
 		if ikey.Sequence <= i.sequence {
-			// For backward iteration, stop when we find a different user key
-			// (savedKey already has the previous key, so stop if current key differs)
-			if valueType != KTypeDeletion && !i.savedKey.Empty() && i.userComparator.Compare(ikey.UserKey, i.savedKey) < 0 {
-				// Found a different user key that's less than savedKey (going backward)
-				// This is the correct stopping point
-				break
-			}
 			valueType = ikey.Type
 			if valueType == KTypeDeletion {
 				i.savedKey.Clear()
@@ -228,7 +223,19 @@ func (i *DBIter) findPrevUserEntry() {
 				i.savedValue = i.iter.Value().Data()
 			}
 		}
+		// Move to previous before checking if we should stop
+		// This ensures we process the current entry first
 		i.iter.Prev()
+		
+		// After moving, check if we've crossed to a different user key
+		if !i.savedKey.Empty() && i.iter.Valid() {
+			nextIkey := &ParsedInternalKey{}
+			if parseInternalKey(i.iter.Key(), nextIkey) && 
+			   i.userComparator.Compare(nextIkey.UserKey, i.savedKey) != 0 {
+				// We've moved to a different user key, stop here
+				break
+			}
+		}
 	}
 
 	if valueType == KTypeDeletion {

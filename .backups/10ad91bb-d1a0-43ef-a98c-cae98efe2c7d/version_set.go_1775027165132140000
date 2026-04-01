@@ -1,7 +1,6 @@
 package db
 
 import (
-	"strconv"
 	"sync"
 
 	"github.com/akzj/go-leveldb/table"
@@ -22,7 +21,42 @@ const kMaxMemCompactionLevel = 2
 
 // FileMetaData stores metadata for an SSTable file.
 // Invariant: smallest key < largest key (in user comparator order)
-type FileMetaData struct {
+type FileMetaData
+
+// ApproximateOffsetOf returns approximate file offset for key.
+// Invariant: returns sum of sizes of files that may contain the key.
+// Why not return exact offset? Table lookup per key is expensive; approximation is O(log n).
+// Why return sum of sizes? GetApproximateSizes needs range size = limit_offset - start_offset.
+func (vs *VersionSet) ApproximateOffsetOf(v *Version, key InternalKey) uint64 {
+	var result uint64
+	for level := 0; level < kNumLevels; level++ {
+		overlapping := v.GetOverlappingInputs(level, &key, &key)
+		for _, meta := range overlapping {
+			result += meta.FileSize
+		}
+	}
+	return result
+}
+
+// DebugString returns a multi-line string describing all SSTables in this version.
+// Used by GetProperty("leveldb.sstables").
+// Format: per-level summary showing file number, size, smallest, largest keys.
+func (v *Version) DebugString() string {
+	var result string
+	for level := 0; level < kNumLevels; level++ {
+		if len(v.files[level]) > 0 {
+			result += fmt.Sprintf("--- level %d ---\n", level)
+			for _, meta := range v.files[level] {
+				result += fmt.Sprintf("  %06d %7d %s .. %s\n",
+					meta.FileNumber, meta.FileSize,
+					meta.Smallest.UserKey.String(),
+					meta.Largest.UserKey.String())
+			}
+		}
+	}
+	return result
+}
+ struct {
 	Number       uint64
 	FileSize     uint64
 	Smallest     InternalKey
@@ -681,54 +715,4 @@ func parseFileNumber(name string) uint64 {
 		num = uint64(name[i]-'0') + num*10
 	}
 	return num
-}
-
-// ApproximateOffsetOf returns approximate file offset for the given internal key.
-// Requires: v is the current version
-// Returns: sum of file sizes for files that may contain key
-func (vs *VersionSet) ApproximateOffsetOf(v *Version, key InternalKey) uint64 {
-	result := uint64(0)
-	keyEncoded := key.Encode()
-	for level := 0; level < kNumLevels; level++ {
-		files := v.files[level]
-		for i := 0; i < len(files); i++ {
-			if vs.icmp.Compare(files[i].Largest.Encode(), keyEncoded) <= 0 {
-				// Entire file is before "key", so just add the file size
-				result += files[i].FileSize
-			} else if vs.icmp.Compare(files[i].Smallest.Encode(), keyEncoded) > 0 {
-				// Entire file is after "key", so ignore
-				if level > 0 {
-					// Files other than level 0 are sorted by meta-smallest, so
-					// no further files in this level will contain data for
-					// "key".
-					break
-				}
-			} else {
-				// "key" falls in the range for this table. Add the
-				// approximate offset of "key" within the table.
-				tbl, err := vs.tableCache.GetTable(files[i].Number, files[i].FileSize)
-				if err.OK() && tbl != nil {
-					result += tbl.ApproximateOffsetOf(keyEncoded)
-				}
-			}
-		}
-	}
-	return result
-}
-
-// DebugString returns a multi-line description of the version's SSTables.
-// Used by GetProperty("leveldb.sstables").
-// Format: per-level listing with file number, size, and key range.
-func (v *Version) DebugString() string {
-	var r string
-	for level := 0; level < kNumLevels; level++ {
-		r += "--- level " + strconv.Itoa(level) + " ---\n"
-		files := v.files[level]
-		for i := 0; i < len(files); i++ {
-			r += " " + strconv.FormatUint(files[i].Number, 10)
-			r += ":" + strconv.FormatUint(files[i].FileSize, 10)
-			r += "[" + files[i].Smallest.UserKey().String() + " .. " + files[i].Largest.UserKey().String() + "]\n"
-		}
-	}
-	return r
 }

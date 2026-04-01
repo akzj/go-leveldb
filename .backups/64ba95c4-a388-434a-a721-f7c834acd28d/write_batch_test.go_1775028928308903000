@@ -1,0 +1,162 @@
+package db
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/akzj/go-leveldb/util"
+)
+
+
+
+// TestWriteBatchDelete tests that Delete operation in a write batch removes a key.
+// Invariant: After Delete in batch, key should not exist.
+func TestWriteBatchDelete(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write a key first
+	db.Put(nil, util.MakeSlice([]byte("key1")), util.MakeSlice([]byte("value1")))
+
+	// Verify it exists
+	val, status := db.Get(nil, util.MakeSlice([]byte("key1")))
+	if !status.OK() {
+		t.Fatalf("Initial Get failed: %v", status.ToString())
+	}
+	if string(val) != "value1" {
+		t.Errorf("Expected value1, got %q", string(val))
+	}
+
+	// Create a batch that deletes the key
+	batch := NewWriteBatch()
+	batch.Delete(util.MakeSlice([]byte("key1")))
+
+	// Write the batch
+	if status := db.Write(nil, batch); !status.OK() {
+		t.Fatalf("Write failed: %v", status.ToString())
+	}
+
+	// Key should no longer exist
+	_, status = db.Get(nil, util.MakeSlice([]byte("key1")))
+	if !status.IsNotFound() {
+		t.Errorf("Expected NotFound after Delete, got status: %v", status.ToString())
+	}
+}
+
+// TestWriteBatchMixed tests mixing Put and Delete operations in a single batch.
+// Invariant: All operations in batch should be applied atomically.
+func TestWriteBatchMixed(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write initial data
+	db.Put(nil, util.MakeSlice([]byte("key1")), util.MakeSlice([]byte("value1")))
+	db.Put(nil, util.MakeSlice([]byte("key2")), util.MakeSlice([]byte("value2")))
+	db.Put(nil, util.MakeSlice([]byte("key3")), util.MakeSlice([]byte("value3")))
+
+	// Create a batch with mixed operations:
+	// - Delete key1
+	// - Put key2 with new value
+	// - Put key4 (new key)
+	batch := NewWriteBatch()
+	batch.Delete(util.MakeSlice([]byte("key1")))
+	batch.Put(util.MakeSlice([]byte("key2")), util.MakeSlice([]byte("new_value2")))
+	batch.Put(util.MakeSlice([]byte("key4")), util.MakeSlice([]byte("value4")))
+
+	// Write the batch
+	if status := db.Write(nil, batch); !status.OK() {
+		t.Fatalf("Write failed: %v", status.ToString())
+	}
+
+	// Verify key1 is deleted
+	_, status := db.Get(nil, util.MakeSlice([]byte("key1")))
+	if !status.IsNotFound() {
+		t.Errorf("Expected key1 to be deleted")
+	}
+
+	// Verify key2 has new value
+	val, status := db.Get(nil, util.MakeSlice([]byte("key2")))
+	if !status.OK() {
+		t.Fatalf("Get key2 failed: %v", status.ToString())
+	}
+	if string(val) != "new_value2" {
+		t.Errorf("Expected key2=new_value2, got %q", string(val))
+	}
+
+	// Verify key3 is unchanged
+	val, status = db.Get(nil, util.MakeSlice([]byte("key3")))
+	if !status.OK() {
+		t.Fatalf("Get key3 failed: %v", status.ToString())
+	}
+	if string(val) != "value3" {
+		t.Errorf("Expected key3=value3, got %q", string(val))
+	}
+
+	// Verify key4 was added
+	val, status = db.Get(nil, util.MakeSlice([]byte("key4")))
+	if !status.OK() {
+		t.Fatalf("Get key4 failed: %v", status.ToString())
+	}
+	if string(val) != "value4" {
+		t.Errorf("Expected key4=value4, got %q", string(val))
+	}
+}
+
+// TestWriteBatchAtomicity tests that write batch is atomic.
+// Invariant: On batch success, all ops are visible; on failure, none are.
+func TestWriteBatchAtomicity(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write initial data
+	db.Put(nil, util.MakeSlice([]byte("existing")), util.MakeSlice([]byte("old_value")))
+
+	// Create a batch with multiple operations
+	batch := NewWriteBatch()
+	batch.Put(util.MakeSlice([]byte("a")), util.MakeSlice([]byte("1")))
+	batch.Put(util.MakeSlice([]byte("b")), util.MakeSlice([]byte("2")))
+	batch.Put(util.MakeSlice([]byte("c")), util.MakeSlice([]byte("3")))
+
+	// Write the batch
+	if status := db.Write(nil, batch); !status.OK() {
+		t.Fatalf("Write failed: %v", status.ToString())
+	}
+
+	// All operations should be visible
+	val, status := db.Get(nil, util.MakeSlice([]byte("a")))
+	if !status.OK() || string(val) != "1" {
+		t.Errorf("Expected a=1, got status=%v val=%v", status, val)
+	}
+
+	val, status = db.Get(nil, util.MakeSlice([]byte("b")))
+	if !status.OK() || string(val) != "2" {
+		t.Errorf("Expected b=2, got status=%v val=%v", status, val)
+	}
+
+	val, status = db.Get(nil, util.MakeSlice([]byte("c")))
+	if !status.OK() || string(val) != "3" {
+		t.Errorf("Expected c=3, got status=%v val=%v", status, val)
+	}
+
+	// Existing key should still be there
+	val, status = db.Get(nil, util.MakeSlice([]byte("existing")))
+	if !status.OK() || string(val) != "old_value" {
+		t.Errorf("Expected existing=old_value, got status=%v val=%v", status, val)
+	}
+}
+
+// TestWriteBatchClear tests that Clear removes all operations from a batch.
+func TestWriteBatchClear(t *testing.T) {
+	batch := NewWriteBatch()
+
+	// Add some operations
+	batch.Put(util.MakeSlice([]byte("a")), util.MakeSlice([]byte("1")))
+	batch.Put(util.MakeSlice([]byte("b")), util.MakeSlice([]byte("2")))
+
+	// Clear the batch
+	batch.Clear()
+
+	// Batch should be empty - ApproximateSize should be minimal
+	if batch.ApproximateSize() > 10 {
+		t.Errorf("Expected empty batch to have small size, got %d", batch.ApproximateSize())
+	}
+}

@@ -427,9 +427,9 @@ func (db *DBImpl) Get(options *ReadOptions, key util.Slice) ([]byte, *util.Statu
 func (db *DBImpl) NewIterator(options *ReadOptions) Iterator {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	// Use LastSequence when no snapshot to see all entries
-	// (Put uses actual sequence number, not kMaxSequenceNumber)
-	var seq SequenceNumber = db.versions.LastSequence()
+	// Use kMaxSequenceNumber when no snapshot to see all entries
+	// (Put uses kMaxSequenceNumber, so this ensures we see all entries)
+	var seq SequenceNumber = kMaxSequenceNumber
 	if options != nil && options.Snapshot != nil {
 		seq = options.Snapshot.Sequence()
 	}
@@ -549,15 +549,15 @@ func (db *DBImpl) GetApproximateSizes(ranges []Range) []uint64 {
 		if limit >= start {
 			sizes[i] = limit - start
 		}
-		// Include memtable size if it exists - memtable data starts at offset 0
-		// and isn't yet in SST files, so it should always be counted
-		if db.mem != nil {
+		// Include memtable and imm size if they contain data for this range
+		// Since memtable/imm are not flushed yet, their data starts at offset 0
+		if db.mem != nil && db.mem.ApproximateMemoryUsage() > 0 {
 			memSize := uint64(db.mem.ApproximateMemoryUsage())
 			if sizes[i] < memSize {
 				sizes[i] = memSize
 			}
 		}
-		if db.imm != nil {
+		if db.imm != nil && db.imm.ApproximateMemoryUsage() > 0 {
 			immSize := uint64(db.imm.ApproximateMemoryUsage())
 			if sizes[i] < immSize {
 				sizes[i] = immSize

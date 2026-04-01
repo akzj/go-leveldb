@@ -1,8 +1,6 @@
 package memdb
 
 import (
-	"bytes"
-
 	"github.com/akzj/go-leveldb/util"
 )
 
@@ -29,8 +27,6 @@ type MemDB struct {
 	comparator util.Comparator
 	skiplist   *SkipList
 	arena      *util.Arena
-	// Track number of entries for ApproximateMemoryUsage calculation
-	count int
 }
 
 // NewMemDB creates a new memtable with the given comparator.
@@ -40,14 +36,12 @@ func NewMemDB(comparator util.Comparator) *MemDB {
 		comparator: comparator,
 		skiplist:   NewSkipList(comparator, arena),
 		arena:      arena,
-		count:      0,
 	}
 }
 
 // Put stores a key-value pair in the memtable.
 func (m *MemDB) Put(key, value util.Slice) *util.Status {
 	m.skiplist.Insert(key.Data(), value.Data())
-	m.count++
 	return util.NewStatusOK()
 }
 
@@ -65,31 +59,27 @@ func (m *MemDB) Get(key util.Slice) ([]byte, *util.Status) {
 	return node.value, util.NewStatusOK()
 }
 
-// Delete marks a key for deletion in the memtable.
-func (m *MemDB) Delete(key util.Slice) *util.Status {
-	// Insert with deletion marker (type byte = 0)
-	m.skiplist.Insert(key.Data(), nil)
-	m.count++
-	return util.NewStatusOK()
-}
-
 // FindForSnapshot finds an entry for the given user key that is visible
 // at the given snapshot sequence number.
 // Returns (value, nil, ok) if found and not deleted.
-// Returns (nil, NotFound, ok) if found but deleted.
+// Returns (nil, nil, ok) if found but deleted.
 // Returns (nil, NotFound, false) if not found.
 func (m *MemDB) FindForSnapshot(userKey util.Slice, snapshotSeq uint64) ([]byte, *util.Status, bool) {
+	// Create a seek key that will position us at or near entries for this user key.
+	// Internal key format: userKey + seq(7 bytes BE) + type(1 byte)
+	// Since we use 0 for seq and KTypeValue (1) for type, this key is the smallest
+	// possible key with this userKey, positioning us at the start of entries.
+	seekKey := EncodeKey(userKey, 0, KTypeValue)
+
 	iter := m.skiplist.NewIterator()
+	iter.Seek(seekKey)
 
 	// Track the entry with the highest sequence <= snapshotSeq
 	var bestSeq uint64 = 0
 	var bestValue []byte
 	var bestIsDeletion bool
 
-	targetUserKey := userKey.Data()
-
-	// Start from first entry and scan until we pass this user key
-	iter.SeekToFirst()
+	// Scan all entries for this user key
 	for iter.Valid() {
 		encodedKey := iter.Key().Data()
 		if len(encodedKey) < 8 {
@@ -97,29 +87,19 @@ func (m *MemDB) FindForSnapshot(userKey util.Slice, snapshotSeq uint64) ([]byte,
 		}
 		// Extract user key from this entry (everything except the last 8 bytes)
 		userKeyLen := len(encodedKey) - 8
-		entryUserKey := encodedKey[:userKeyLen]
-		
-		// Compare user keys to determine if we've found our entry or passed it
-		cmp := bytes.Compare(entryUserKey, targetUserKey)
-		if cmp > 0 {
-			break // We've gone past our user key
+		if !bytes.Equal(encodedKey[:userKeyLen], userKey.Data()) {
+			break
 		}
-		if cmp < 0 {
-			iter.Next()
-			continue
-		}
-		
-		// This entry has the same user key - extract sequence number (7 bytes, big-endian)
+		// Extract sequence number (7 bytes, big-endian)
 		var seq uint64
 		for i := 0; i < 7; i++ {
 			seq = (seq << 8) | uint64(encodedKey[userKeyLen+i])
 		}
-		
-		// Check if this entry is visible at our snapshot and has higher sequence
+		// Check if this entry is visible at our snapshot
 		if seq <= snapshotSeq && seq > bestSeq {
 			bestSeq = seq
 			bestValue = iter.Value().Data()
-			bestIsDeletion = encodedKey[len(encodedKey)-1] == 0 // KTypeDeletion = 0
+			bestIsDeletion = encodedKey[len(encodedKey)-1] == byte(KTypeDeletion)
 		}
 		iter.Next()
 	}
@@ -128,23 +108,9 @@ func (m *MemDB) FindForSnapshot(userKey util.Slice, snapshotSeq uint64) ([]byte,
 		return nil, util.NotFound(""), false
 	}
 	if bestIsDeletion {
-		return nil, util.NotFound(""), true
+		return nil, nil, true
 	}
 	return bestValue, util.NewStatusOK(), true
-}
-
-// NewIterator returns an iterator over the memtable.
-func (m *MemDB) NewIterator() Iterator {
-	return m.skiplist.NewIterator()
-}
-
-// ApproximateMemoryUsage returns the approximate memory usage of the memtable.
-func (m *MemDB) ApproximateMemoryUsage() int {
-	// Use arena memory + estimated overhead for entries
-	arenaMem := int(m.arena.MemoryUsage())
-	// Estimate ~64 bytes per entry overhead (node struct, pointers, etc.)
-	entryOverhead := m.count * 64
-	return arenaMem + entryOverhead
 }
 
 // isDeletionMarker checks if the internal key represents a deletion.
@@ -155,4 +121,24 @@ func isDeletionMarker(encodedKey []byte) bool {
 		return false
 	}
 	return encodedKey[len(encodedKey)-1] == 0 // KTypeDeletion = 0
+}
+
+// Delete removes a key from the memtable.
+// In LevelDB, deletion is done by inserting a tombstone marker.
+func (m *MemDB) Delete(key util.Slice) *util.Status {
+	// LevelDB marks deletion with a special value
+	// We use nil value with deletion semantics
+	// The skiplist Insert will update existing key with new value
+	m.skiplist.Insert(key.Data(), []byte{})
+	return util.NewStatusOK()
+}
+
+// NewIterator returns an iterator over the memtable.
+func (m *MemDB) NewIterator() Iterator {
+	return m.skiplist.NewIterator()
+}
+
+// ApproximateMemoryUsage returns the approximate memory usage of the memtable.
+func (m *MemDB) ApproximateMemoryUsage() int {
+	return m.skiplist.ApproximateMemoryUsage()
 }

@@ -81,7 +81,6 @@ func DestroyDB(name string, options *Options) *util.Status {
 	if !err.OK() {
 		return err
 	}
-	// Always release lock when done
 	defer env.UnlockFile(lock)
 
 	// Get all files in the database directory
@@ -90,10 +89,11 @@ func DestroyDB(name string, options *Options) *util.Status {
 		return err
 	}
 
-	// Delete all files (skip CURRENT and LOCK)
+	// Delete all files
 	var firstError *util.Status
 	for _, child := range children {
 		if child == CurrentFileName() || child == LockFileName() {
+			// Skip CURRENT and LOCK files
 			continue
 		}
 		err := env.DeleteFile(name + "/" + child)

@@ -45,7 +45,6 @@ func (a *Arena) Allocate(n int) []byte {
 		result := a.blocks[len(a.blocks)-1][a.allocPtr : a.allocPtr+n]
 		a.allocPtr += n
 		a.allocBytesRemaining -= n
-		a.totalBytes += uint64(n) // Track memory usage
 		return result
 	}
 	// Allocate new block

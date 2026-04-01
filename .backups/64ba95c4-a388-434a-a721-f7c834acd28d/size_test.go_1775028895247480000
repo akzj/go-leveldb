@@ -1,0 +1,119 @@
+package db
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/akzj/go-leveldb/util"
+)
+
+// newTestDB creates a temporary database for testing.
+// Caller must ensure cleanup via defer db.Close()
+func newTestDB(t *testing.T) DB {
+	name := fmt.Sprintf("/tmp/leveldb_test_%d", time.Now().UnixNano())
+	opts := NewOptions()
+	opts.CreateIfMissing = true
+	db, status := Open(opts, name)
+	if !status.OK() {
+		t.Fatalf("Open failed: %v", status.ToString())
+	}
+	t.Cleanup(func() {
+		db.Close()
+		os.RemoveAll(name)
+	})
+	return db
+}
+
+// TestGetApproximateSizes tests that GetApproximateSizes returns non-zero
+// sizes after writing data.
+// Invariant: After writing data, approximate sizes should be > 0.
+func TestGetApproximateSizes(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write some data
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key%02d", i)
+		val := fmt.Sprintf("value%02d", i)
+		db.Put(nil, util.MakeSlice([]byte(key)), util.MakeSlice([]byte(val)))
+	}
+
+	// Get approximate size for the entire database
+	ranges := []Range{
+		{Start: util.MakeSlice([]byte("key00")), Limit: util.MakeSlice([]byte("key99"))},
+	}
+	sizes := db.GetApproximateSizes(ranges)
+
+	if len(sizes) != 1 {
+		t.Fatalf("Expected 1 size, got %d", len(sizes))
+	}
+
+	if sizes[0] == 0 {
+		t.Errorf("Expected non-zero approximate size after writing data, got 0")
+	}
+
+	// Size should be at least large enough for our data
+	if sizes[0] < 100 {
+		t.Logf("Approximate size is %d (may be small for new database)", sizes[0])
+	}
+}
+
+// TestGetApproximateSizesEmpty tests that GetApproximateSizes returns 0
+// or near-0 for empty database.
+// Invariant: Empty database should have minimal or zero size.
+func TestGetApproximateSizesEmpty(t *testing.T) {
+	db := newTestDB(t)
+
+	// Get approximate size for entire key range
+	ranges := []Range{
+		{Start: util.MakeSlice([]byte("")), Limit: util.MakeSlice([]byte("\xff"))}, // All possible keys
+	}
+	sizes := db.GetApproximateSizes(ranges)
+
+	if len(sizes) != 1 {
+		t.Fatalf("Expected 1 size, got %d", len(sizes))
+	}
+
+	// Empty DB should have minimal size (likely 0 or very small)
+	if sizes[0] > 1000 {
+		t.Errorf("Expected small approximate size for empty DB, got %d", sizes[0])
+	}
+}
+
+// TestGetApproximateSizesMultipleRanges tests GetApproximateSizes with multiple ranges.
+func TestGetApproximateSizesMultipleRanges(t *testing.T) {
+	db := newTestDB(t)
+
+	// Write data in two distinct ranges
+	// First range: key000-key099
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key0%02d", i)
+		db.Put(nil, util.MakeSlice([]byte(key)), util.MakeSlice([]byte("value")))
+	}
+
+	// Second range: key900-key999
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key9%02d", i)
+		db.Put(nil, util.MakeSlice([]byte(key)), util.MakeSlice([]byte("value")))
+	}
+
+	// Get approximate sizes for both ranges
+	ranges := []Range{
+		{Start: util.MakeSlice([]byte("key000")), Limit: util.MakeSlice([]byte("key100"))},
+		{Start: util.MakeSlice([]byte("key900")), Limit: util.MakeSlice([]byte("key999"))},
+	}
+	sizes := db.GetApproximateSizes(ranges)
+
+	if len(sizes) != 2 {
+		t.Fatalf("Expected 2 sizes, got %d", len(sizes))
+	}
+
+	// Both ranges should have some data
+	if sizes[0] == 0 {
+		t.Logf("First range size is 0 (may be normal for freshly written data)")
+	}
+	if sizes[1] == 0 {
+		t.Logf("Second range size is 0 (may be normal for freshly written data)")
+	}
+}

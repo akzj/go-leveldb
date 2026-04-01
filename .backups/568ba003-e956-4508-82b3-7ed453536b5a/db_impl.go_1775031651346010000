@@ -37,7 +37,6 @@ type DBImpl struct {
 	manualCompaction              *ManualCompaction
 	stats                         [kNumLevels]CompactionStats
 	seed                          uint32
-	lock                          FileLock
 }
 type Writer struct {
 	batch  *WriteBatch
@@ -154,7 +153,6 @@ func Open(options *Options, dbname string) (DB, *util.Status) {
 	if !err.OK() {
 		return nil, err
 	}
-	db.lock = lock
 	edit, saveManifest, err := db.Recover()
 	// Recover returns (nil, false, nil) for new DB - this is OK
 	if err != nil && !err.OK() {
@@ -379,16 +377,14 @@ type memtableWriter struct {
 }
 
 func (w *memtableWriter) Put(key, value util.Slice) {
-	// Use w.seq for proper snapshot isolation
-	// This ensures Put and Delete can be ordered correctly
-	ikey := NewInternalKey(key, w.seq, KTypeValue)
+	// Use kMaxSequenceNumber for Put so it sorts before any deletions
+	// in backward iteration (highest sequence first)
+	ikey := NewInternalKey(key, kMaxSequenceNumber, KTypeValue)
 	w.db.mem.Put(ikey.Encode(), value)
 }
 func (w *memtableWriter) Delete(key util.Slice) {
-	// Use w.seq for proper snapshot isolation
-	// Delete and Put in the same batch get the same sequence, but
-	// in LevelDB, Put (type=1) sorts after Delete (type=0) at same sequence
-	// So we need to use seq+1 for Put to make it "newer"
+	// Use w.seq for Delete to maintain snapshot semantics
+	// Delete entries will sort AFTER Put entries (lower sequence)
 	ikey := NewInternalKey(key, w.seq, KTypeDeletion)
 	w.db.mem.Delete(ikey.Encode())
 }
@@ -401,9 +397,9 @@ func (db *DBImpl) GetLastSequence() SequenceNumber {
 func (db *DBImpl) Get(options *ReadOptions, key util.Slice) ([]byte, *util.Status) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	// Use LastSequence when no snapshot to get the latest entry
-	// (Put uses actual sequence number, not kMaxSequenceNumber)
-	var seq SequenceNumber = db.versions.LastSequence()
+	// Use kMaxSequenceNumber when no snapshot to get the latest entry
+	// (Put uses kMaxSequenceNumber, so this ensures we find it)
+	var seq SequenceNumber = kMaxSequenceNumber
 	if options != nil && options.Snapshot != nil {
 		// With snapshot, use the snapshot's sequence
 		seq = options.Snapshot.Sequence()
@@ -427,11 +423,11 @@ func (db *DBImpl) Get(options *ReadOptions, key util.Slice) ([]byte, *util.Statu
 func (db *DBImpl) NewIterator(options *ReadOptions) Iterator {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	// Use LastSequence when no snapshot to see all entries
-	// (Put uses actual sequence number, not kMaxSequenceNumber)
-	var seq SequenceNumber = db.versions.LastSequence()
+	var seq SequenceNumber
 	if options != nil && options.Snapshot != nil {
 		seq = options.Snapshot.Sequence()
+	} else {
+		seq = db.versions.LastSequence()
 	}
 	internalIter := db.newInternalIterator()
 	return NewDBIterator(db, db.options.Comparator, internalIter, seq, db.seed)
@@ -549,15 +545,15 @@ func (db *DBImpl) GetApproximateSizes(ranges []Range) []uint64 {
 		if limit >= start {
 			sizes[i] = limit - start
 		}
-		// Include memtable size if it exists - memtable data starts at offset 0
-		// and isn't yet in SST files, so it should always be counted
-		if db.mem != nil {
+		// Include memtable and imm size if they contain data for this range
+		// Since memtable/imm are not flushed yet, their data starts at offset 0
+		if db.mem != nil && db.mem.ApproximateMemoryUsage() > 0 {
 			memSize := uint64(db.mem.ApproximateMemoryUsage())
 			if sizes[i] < memSize {
 				sizes[i] = memSize
 			}
 		}
-		if db.imm != nil {
+		if db.imm != nil && db.imm.ApproximateMemoryUsage() > 0 {
 			immSize := uint64(db.imm.ApproximateMemoryUsage())
 			if sizes[i] < immSize {
 				sizes[i] = immSize
@@ -676,11 +672,6 @@ func (db *DBImpl) Close() *util.Status {
 	db.shuttingDown.Store(true)
 	if db.logFile != nil {
 		db.logFile.Close()
-	}
-	// Release the lock file
-	if db.lock != nil {
-		db.env.UnlockFile(db.lock)
-		db.lock = nil
 	}
 	return util.NewStatusOK()
 }

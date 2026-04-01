@@ -1,7 +1,6 @@
 package db
 
 import (
-	"strconv"
 	"sync"
 
 	"github.com/akzj/go-leveldb/table"
