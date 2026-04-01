@@ -606,21 +606,3 @@ func (a *randomAccessFileAdapter) ReadAt(p []byte, offset int64) (n int, err *ut
 	n = copy(p, data)
 	return n, util.NewStatusOK()
 }
-
-// writableFileAdapter wraps db.WritableFile for table.WritableFile.
-type writableFileAdapter struct {
-	file WritableFile
-}
-
-func (a *writableFileAdapter) Append(data util.Slice) *util.Status {
-	return a.file.Append(data)
-}
-func (a *writableFileAdapter) Close() *util.Status {
-	return a.file.Close()
-}
-func (a *writableFileAdapter) Flush() *util.Status {
-	return a.file.Flush()
-}
-func (a *writableFileAdapter) Sync() *util.Status {
-	return a.file.Sync()
-}

@@ -582,16 +582,6 @@ func (e *tableEnvAdapter) DeleteFile(name string) *util.Status {
 func (e *tableEnvAdapter) GetFileSize(name string) (uint64, *util.Status) {
 	return e.env.GetFileSize(name)
 }
-func (e *tableEnvAdapter) NewWritableFile(name string) (table.WritableFile, *util.Status) {
-	file, err := e.env.NewWritableFile(name)
-	if !err.OK() {
-		return nil, err
-	}
-	return &writableFileAdapter{file: file}, err
-}
-func (e *tableEnvAdapter) CreateDir(dir string) *util.Status {
-	return e.env.CreateDir(dir)
-}
 
 // randomAccessFileAdapter wraps db.RandomAccessFile for table.RandomAccessFile.
 type randomAccessFileAdapter struct {
@@ -605,22 +595,4 @@ func (a *randomAccessFileAdapter) ReadAt(p []byte, offset int64) (n int, err *ut
 	}
 	n = copy(p, data)
 	return n, util.NewStatusOK()
-}
-
-// writableFileAdapter wraps db.WritableFile for table.WritableFile.
-type writableFileAdapter struct {
-	file WritableFile
-}
-
-func (a *writableFileAdapter) Append(data util.Slice) *util.Status {
-	return a.file.Append(data)
-}
-func (a *writableFileAdapter) Close() *util.Status {
-	return a.file.Close()
-}
-func (a *writableFileAdapter) Flush() *util.Status {
-	return a.file.Flush()
-}
-func (a *writableFileAdapter) Sync() *util.Status {
-	return a.file.Sync()
 }

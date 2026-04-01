@@ -3,9 +3,6 @@ package db
 import (
 	"sync"
 
-	"github.com/akzj/go-leveldb/log"
-	"github.com/akzj/go-leveldb/memdb"
-	"github.com/akzj/go-leveldb/table"
 	"github.com/akzj/go-leveldb/util"
 )
 

@@ -438,47 +438,8 @@ func (vs *VersionSet) PickCompaction() *Compaction {
 //   Invariant: Output level is chosen to minimize space amplification
 //   Why not just merge? Must respect size ratio between levels
 func (vs *VersionSet) RunCompaction(c *Compaction) (*VersionEdit, *util.Status) {
+	// TODO: implement actual compaction logic
 	edit := NewVersionEdit()
-
-	// If trivial move (single file, no overlap), just delete input
-	if c.IsTrivialMove() {
-		// Delete input files
-		for _, f := range c.inputFiles[0] {
-			edit.RemoveFile(c.level, f.Number)
-		}
-		for _, f := range c.inputFiles[1] {
-			edit.RemoveFile(c.level+1, f.Number)
-		}
-		// Add file to next level
-		if len(c.inputFiles[0]) == 1 {
-			f := c.inputFiles[0][0]
-			edit.AddFile(c.level+1, FileMetaData{
-				Number:   f.Number,
-				FileSize: f.FileSize,
-				Smallest: f.Smallest,
-				Largest:  f.Largest,
-			})
-		}
-		return edit, util.NewStatusOK()
-	}
-
-	// For actual compaction, mark input files as deleted
-	// Note: In a full implementation, we would:
-	// 1. Create iterators for all input files
-	// 2. Merge them together
-	// 3. Write new SSTables using BuildTable
-	// 4. Create VersionEdit with the new files
-	// For now, just mark inputs as deleted
-	for _, f := range c.inputFiles[0] {
-		edit.RemoveFile(c.level, f.Number)
-	}
-	for _, f := range c.inputFiles[1] {
-		edit.RemoveFile(c.level+1, f.Number)
-	}
-
-	// Set next file number for new SSTables
-	edit.SetNextFile(vs.nextFileNumber)
-
 	return edit, util.NewStatusOK()
 }
 

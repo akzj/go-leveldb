@@ -229,6 +229,12 @@ type WritableFile interface {
 	Sync() *util.Status
 }
 
+// Env is the interface for file system operations needed by BuildTable.
+type Env interface {
+	NewWritableFile(name string) (WritableFile, *util.Status)
+	CreateDir(dir string) *util.Status
+}
+
 // BuildTable builds a SSTable from an iterator.
 // Invariant: iterator must be positioned at first key
 // Invariant: iterator must be invalid or have kTypeValue entries only

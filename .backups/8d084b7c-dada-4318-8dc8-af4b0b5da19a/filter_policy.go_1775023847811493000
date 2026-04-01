@@ -87,7 +87,7 @@ func (p *BloomFilterPolicy) CreateFilter(keys []util.Slice, dst []byte) []byte {
 		// Double hashing: delta = (h >> 17) | (h << 15)
 		delta := (h >> 17) | (h << 15)
 		for i := 0; i < p.k; i++ {
-			bitpos := h % uint32(bits)
+			bitpos := h % bits
 			array[bitpos/8] |= (1 << (bitpos % 8))
 			h += delta
 		}

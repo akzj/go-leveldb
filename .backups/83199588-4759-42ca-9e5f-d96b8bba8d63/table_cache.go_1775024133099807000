@@ -10,8 +10,6 @@ import (
 // Env interface for file operations.
 type Env interface {
 	NewRandomAccessFile(name string) (RandomAccessFile, *util.Status)
-	NewWritableFile(name string) (WritableFile, *util.Status)
-	CreateDir(dir string) *util.Status
 	LockFile(name string) (interface{}, *util.Status)
 	UnlockFile(lock interface{}) *util.Status
 	ReadFile(name string, data []byte) (int, *util.Status)

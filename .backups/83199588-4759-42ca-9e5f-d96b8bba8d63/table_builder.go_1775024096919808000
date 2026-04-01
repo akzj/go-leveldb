@@ -234,52 +234,7 @@ type WritableFile interface {
 // Invariant: iterator must be invalid or have kTypeValue entries only
 // Output: file named with fileNumber in dirname
 // Returns: (fileSize, status)
-func BuildTable(env Env, dirname string, fileNumber uint64, options *TableBuilderOptions, iter Iterator) (uint64, *util.Status) {
-	// Open a new file for writing
-	fileName := dirname + "/" + TableFileName(fileNumber)
-	file, err := env.NewWritableFile(fileName)
-	if !err.OK() {
-		return 0, err
-	}
-
-	// Create table builder
-	builder := NewTableBuilder(file, options)
-
-	// Iterate over all key-value pairs and add to table
-	for iter.Valid() {
-		key := iter.Key()
-		value := iter.Value()
-		status := builder.Add(key, value)
-		if !status.OK() {
-			builder.Abandon()
-			file.Close()
-			// Delete the incomplete file
-			env.DeleteFile(fileName)
-			return 0, status
-		}
-		iter.Next()
-	}
-
-	// Check iterator status
-	if status := iter.Status(); !status.OK() {
-		builder.Abandon()
-		file.Close()
-		env.DeleteFile(fileName)
-		return 0, status
-	}
-
-	// Finish building the table
-	fileSize, status := builder.Finish()
-	if !status.OK() {
-		file.Close()
-		env.DeleteFile(fileName)
-		return 0, status
-	}
-
-	// Close the file
-	if err := file.Close(); !err.OK() {
-		return 0, err
-	}
-
-	return fileSize, util.NewStatusOK()
+func BuildTable(dirname string, fileNumber uint64, options *TableBuilderOptions, iter Iterator) (uint64, *util.Status) {
+	// TODO: implement BuildTable
+	panic("TODO: implement BuildTable")
 }
